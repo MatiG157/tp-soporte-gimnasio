@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile pose_utils.py exercises.py form_checks.py main.py)",
+      "Bash(python \"C:\\\\Users\\\\PC100\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\r--4to-A-o-Ing-en-Sistemas-Soporte-a-la-Gestion-de-Datos-Repositorio-gimnasio-tp-soporte-gimnasio\\\\95ad16d0-e6b4-401b-a435-3ead0a6cadf2\\\\scratchpad\\\\test_logic.py\")",
+      "Bash(python -c ' *)"
+    ]
+  }
+}
