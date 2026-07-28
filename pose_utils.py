@@ -99,3 +99,80 @@ def forward_offset(from_point, to_point, sign):
     por delante de from_point.
     """
     return (to_point[0] - from_point[0]) * sign
+
+
+def back_bow(mask, shoulder, hip, knee, samples=24, max_depth=0.6):
+    """
+    Mide cuanto se arquea el contorno de la espalda respecto de la linea
+    recta hombro-cadera, usando la mascara de segmentacion de la persona.
+
+    Los landmarks de pose no tienen puntos de columna, asi que el
+    redondeo de espalda no se puede sacar de ellos. La silueta si lo
+    muestra: con la espalda neutra el borde de la espalda va practicamente
+    recto y paralelo a la linea hombro-cadera, y cuando se redondea ese
+    borde se abomba hacia afuera.
+
+    Como se calcula: se recorre la linea hombro-cadera y desde cada punto
+    se tira un rayo perpendicular hacia el lado de la espalda (el opuesto
+    a la rodilla, que queda del lado de la panza) hasta salir de la
+    mascara. Eso da el perfil del borde de la espalda. Al perfil se le
+    resta la recta que une sus propios extremos, de modo que lo que queda
+    es la CURVATURA y no el grosor del torso ni la inclinacion. El
+    resultado se divide por el largo del torso para que no dependa de la
+    distancia a la camara ni del tamaño de la persona.
+
+    Devuelve la flecha del arco como fraccion del largo del torso
+    (0 = recta, mas alto = mas redondeada), o None si no se pudo medir.
+    """
+    s = np.asarray(shoulder, dtype=float)
+    h_pt = np.asarray(hip, dtype=float)
+    k = np.asarray(knee, dtype=float)
+
+    chord = h_pt - s
+    torso_len = float(np.hypot(chord[0], chord[1]))
+    if torso_len < 25:
+        return None
+
+    along = chord / torso_len
+    normal = np.array([-along[1], along[0]])
+    # La espalda esta del lado opuesto a la rodilla.
+    if float(np.dot(k - s, normal)) > 0:
+        normal = -normal
+
+    height, width = mask.shape
+    depth = int(torso_len * max_depth)
+    if depth < 5:
+        return None
+
+    t = np.linspace(0.0, 1.0, samples + 1)
+    base = s[None, :] + chord[None, :] * t[:, None]
+    steps = np.arange(depth, dtype=float)
+    pts = base[:, None, :] + normal[None, None, :] * steps[None, :, None]
+
+    xs = np.clip(np.rint(pts[..., 0]).astype(int), 0, width - 1)
+    ys = np.clip(np.rint(pts[..., 1]).astype(int), 0, height - 1)
+    in_image = ((pts[..., 0] >= 0) & (pts[..., 0] < width)
+                & (pts[..., 1] >= 0) & (pts[..., 1] < height))
+    in_body = (mask[ys, xs] >= 0.5) & in_image
+
+    # Solo sirven los rayos que arrancan dentro del cuerpo y que llegan a
+    # salir: si el rayo nunca sale, el borde quedo fuera del alcance y la
+    # medicion de ese punto no es confiable.
+    exited = ~in_body
+    usable = in_body[:, 0] & exited.any(axis=1)
+    if usable.sum() < samples * 0.7:
+        return None
+
+    edge = np.argmax(exited, axis=1).astype(float)[usable]
+    t_ok = t[usable]
+
+    inner = (t_ok >= 0.12) & (t_ok <= 0.88)
+    if inner.sum() < 5:
+        return None
+
+    # Recta entre los extremos del propio perfil: aisla la curvatura.
+    start = float(np.interp(0.12, t_ok, edge))
+    end = float(np.interp(0.88, t_ok, edge))
+    straight = start + (end - start) * (t_ok - 0.12) / 0.76
+
+    return float(np.max((edge - straight)[inner])) / torso_len

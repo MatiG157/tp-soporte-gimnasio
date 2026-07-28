@@ -14,11 +14,12 @@ import time
 import urllib.request
 
 import cv2
+import numpy as np
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
-from pose_utils import calculate_angle, facing_sign, midpoint, POSE_CONNECTIONS, JOINTS
+from pose_utils import back_bow, calculate_angle, facing_sign, midpoint, POSE_CONNECTIONS, JOINTS
 from exercises import EXERCISES
 import form_checks
 
@@ -55,6 +56,33 @@ VISIBILITY_THRESHOLD = 0.5
 NEUTRAL_BACKNECK_ALPHA = 0.05
 # Cuadros parado/arriba necesarios antes de confiar en esa referencia.
 MIN_BASELINE_FRAMES = 15
+# Angulo de cadera a partir del cual consideramos que la persona esta
+# realmente parada. La neutra se aprende SOLO con estos cuadros: antes
+# se usaba el estado "up", que arranca activo aunque el video empiece
+# con la persona ya agachada, y eso metia postura agachada dentro de la
+# referencia de "postura neutra de pie".
+MIN_STANDING_ANGLE = 155
+
+# Un intento que nunca sube no llega a contar como repeticion, y sin
+# esto no mostraria ningun aviso justo en el caso que peor pinta tiene.
+# Al terminar, si quedo abajo y la cadera nunca se acerco a extenderse,
+# lo reportamos igual.
+#
+# No se avisa durante la bajada: medido sobre video, un peso muerto
+# correcto puede pasar 9 segundos abajo acomodandose y recien extender
+# la cadera al final (cruza estos grados a los 8.3s de una bajada de
+# 9.1s), asi que cualquier aviso por tiempo marca tecnica buena. Lo que
+# si separa bien es el angulo: en las bajadas correctas la cadera llego
+# a ~165 grados y en el intento fallido nunca paso de 119.
+STUCK_LOCKOUT_ANGLE = 145
+
+# La repeticion se cuenta apenas el angulo de cadera cruza angle_up, que
+# es antes de que la persona termine de pararse. Si se evaluara ahi
+# mismo, el lockout quedaria medido a mitad de camino y marcaria falta
+# de extension incluso en repeticiones que terminan bien. Por eso se
+# espera este ratito antes de juzgar la repeticion: la cuenta sube en el
+# momento, pero el veredicto mira tambien el final del movimiento.
+LOCKOUT_GRACE_SECONDS = 0.5
 
 
 def ensure_model():
@@ -121,11 +149,16 @@ def run(exercise_key, video_path=None):
     is_video_file = video_path is not None
     source = video_path if is_video_file else 0
 
+    # La mascara de segmentacion es la que permite ver el redondeo de
+    # espalda (los landmarks no tienen puntos de columna). Solo hace
+    # falta en peso muerto; en sentadilla se ahorra ese trabajo.
+    needs_mask = exercise_key == "deadlift"
     options = PoseLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=MODEL_PATH),
         running_mode=VisionRunningMode.VIDEO,
         min_pose_detection_confidence=0.6,
         min_tracking_confidence=0.6,
+        output_segmentation_masks=needs_mask,
     )
 
     cap = cv2.VideoCapture(source)
@@ -176,6 +209,8 @@ def run(exercise_key, video_path=None):
     smoothed_angle = None
     neutral_backneck = None
     neutral_backneck_frames = 0
+    max_hip_in_down = 0.0
+    pending_rep_frames = None
     start_time = time.time()
     frame_index = 0
     last_timestamp_ms = -1
@@ -186,6 +221,24 @@ def run(exercise_key, video_path=None):
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
+                # El video puede cortar con una repeticion contada pero
+                # todavia sin juzgar: la evaluamos con lo medido.
+                if pending_rep_frames is not None:
+                    feedback_lines = form_checks.evaluate_rep(exercise_key, config, metrics, truncated=True)
+                    pending_rep_frames = None
+                # Quedo abajo sin acercarse nunca a extender la cadera: fue
+                # un intento que no se completo, no el corte del video. Sin
+                # esto no se cuenta la repeticion y no se muestra nada.
+                elif (exercise_key == "deadlift" and stage == "down"
+                        and 0 < max_hip_in_down < STUCK_LOCKOUT_ANGLE):
+                    feedback_lines = [("Intento sin terminar: no llegaste a extender la cadera arriba", False)]
+                    level = form_checks.rounded_back_level(metrics["back_bows"])
+                    if level == 2:
+                        feedback_lines.append(("Espalda MUY redondeada, para y baja el peso", False))
+                    elif level == 1:
+                        feedback_lines.append(("Espalda redondeada, saca pecho y traba la espalda", False))
+                    if metrics["back_rounded"]:
+                        feedback_lines.append(("Cabeza y cuello alineados con la espalda", False))
                 if is_video_file and last_frame is not None:
                     end_msg = f"Fin del video. Repeticiones: {counter}. Presiona una tecla para cerrar."
                     draw_hud(last_frame, config, counter, feedback_lines,
@@ -202,8 +255,19 @@ def run(exercise_key, video_path=None):
                 update_layout(frame)
                 w, h = layout["w"], layout["h"]
 
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+                # Se detecta sobre un lienzo cuadrado con el frame pegado
+                # arriba a la izquierda. Dos motivos: con la mascara de
+                # segmentacion activada mediapipe se cae con imagenes no
+                # cuadradas ("only supported for the square ROI"), y de
+                # paso las coordenadas normalizadas quedan en la misma
+                # escala en x e y, asi que basta multiplicar por el lado.
+                # Como el frame arranca en (0,0), los pixeles del lienzo
+                # dentro del frame son los mismos que los del frame.
+                side_px = max(w, h)
+                canvas = np.zeros((side_px, side_px, 3), dtype=np.uint8)
+                canvas[:h, :w] = frame if frame.shape[2] == 3 else cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+                canvas_rgb = np.ascontiguousarray(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB), dtype=np.uint8)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=canvas_rgb)
 
                 if is_video_file:
                     timestamp_ms = int(frame_index * 1000 / fps)
@@ -223,14 +287,14 @@ def run(exercise_key, video_path=None):
                     landmarks = result.pose_landmarks[0]
                     current_side, avg_vis = choose_side(landmarks, joint_names, current_side)
                     side_label = "izquierdo" if current_side == 0 else "derecho"
-                    draw_skeleton(frame, landmarks, w, h)
+                    draw_skeleton(frame, landmarks, side_px, side_px)
 
                     if avg_vis < VISIBILITY_THRESHOLD:
                         feedback_lines = [("Reacomodate, no se ven bien las articulaciones de ese lado", False)]
                     else:
                         points = {
-                            name: (landmarks[JOINTS[name][current_side]].x * w,
-                                   landmarks[JOINTS[name][current_side]].y * h)
+                            name: (landmarks[JOINTS[name][current_side]].x * side_px,
+                                   landmarks[JOINTS[name][current_side]].y * side_px)
                             for name in joint_names
                         }
                         # linea hombro-cadera "centrada" (promedio de los
@@ -238,12 +302,12 @@ def run(exercise_key, video_path=None):
                         # peso muerto: es mas estable que usar solo el
                         # hombro/cadera del lado cercano a la camara.
                         points["shoulder_center"] = midpoint(
-                            (landmarks[JOINTS["shoulder"][0]].x * w, landmarks[JOINTS["shoulder"][0]].y * h),
-                            (landmarks[JOINTS["shoulder"][1]].x * w, landmarks[JOINTS["shoulder"][1]].y * h),
+                            (landmarks[JOINTS["shoulder"][0]].x * side_px, landmarks[JOINTS["shoulder"][0]].y * side_px),
+                            (landmarks[JOINTS["shoulder"][1]].x * side_px, landmarks[JOINTS["shoulder"][1]].y * side_px),
                         )
                         points["hip_center"] = midpoint(
-                            (landmarks[JOINTS["hip"][0]].x * w, landmarks[JOINTS["hip"][0]].y * h),
-                            (landmarks[JOINTS["hip"][1]].x * w, landmarks[JOINTS["hip"][1]].y * h),
+                            (landmarks[JOINTS["hip"][0]].x * side_px, landmarks[JOINTS["hip"][0]].y * side_px),
+                            (landmarks[JOINTS["hip"][1]].x * side_px, landmarks[JOINTS["hip"][1]].y * side_px),
                         )
 
                         rep_a, rep_b, rep_c = config["rep_angle"]
@@ -262,9 +326,10 @@ def run(exercise_key, video_path=None):
                             down_streak = 0
                             up_streak += 1
                             if up_streak >= DEBOUNCE_FRAMES and stage == "down":
+                                # Se cuenta ya, pero el veredicto espera a que
+                                # termine de extenderse (ver LOCKOUT_GRACE_SECONDS).
                                 counter += 1
-                                feedback_lines = form_checks.evaluate_rep(exercise_key, config, metrics)
-                                metrics = form_checks.initial_metrics(exercise_key)
+                                pending_rep_frames = int(LOCKOUT_GRACE_SECONDS * fps)
                                 stage = "up"
                         elif smoothed_angle < config["angle_down"]:
                             up_streak = 0
@@ -278,38 +343,77 @@ def run(exercise_key, video_path=None):
                         baseline = neutral_backneck if neutral_backneck_frames >= MIN_BASELINE_FRAMES else None
 
                         if exercise_key == "deadlift":
-                            backneck_now = calculate_angle(points["ear"], points["shoulder_center"], points["hip_center"])
-
-                            # Postura neutra de referencia (parado/arriba) para
-                            # detectar cuanto se redondea la espalda respecto
-                            # de como esta esa persona en particular, no solo
-                            # contra un numero fijo que le puede quedar corto
-                            # a alguien que ya de por si esta encorvado parado.
-                            if stage == "up":
+                            # Postura neutra de referencia para medir cuanto se
+                            # desalinea despues la cabeza respecto de como esta
+                            # esa persona en particular (no contra un numero
+                            # fijo, que le queda corto a alguien que ya de por
+                            # si esta encorvado parado). Se aprende solo con la
+                            # cadera realmente extendida: usar el estado "up"
+                            # metia cuadros ya agachados en la referencia.
+                            if raw_angle > MIN_STANDING_ANGLE:
+                                backneck_now = calculate_angle(
+                                    points["ear"], points["shoulder_center"], points["hip_center"])
                                 neutral_backneck_frames += 1
                                 neutral_backneck = backneck_now if neutral_backneck is None else (
                                     NEUTRAL_BACKNECK_ALPHA * backneck_now + (1 - NEUTRAL_BACKNECK_ALPHA) * neutral_backneck
                                 )
 
-                            # MediaPipe no tiene puntos de columna: la linea
-                            # oreja-hombro-cadera se dibuja siempre recta, no
-                            # importa cuanto se arquee la espalda de verdad.
-                            # Para que igual se note en el momento (no solo en
-                            # el resumen de la repeticion), la pintamos de
-                            # rojo apenas se detecta redondeo.
-                            if form_checks.is_back_rounded(backneck_now, baseline):
+                        bow_value = None
+                        if needs_mask and result.segmentation_masks:
+                            mask = np.squeeze(result.segmentation_masks[0].numpy_view())
+                            bow_value = back_bow(mask, points["shoulder"], points["hip"], points["knee"])
+
+                        metrics = form_checks.update_metrics(
+                            exercise_key, metrics, points, sign, stage, smoothed_angle, depth_angle_value,
+                            neutral_backneck=baseline, rep_angle_raw=raw_angle,
+                            back_bow_value=bow_value,
+                        )
+
+                        if exercise_key == "deadlift":
+                            # Aviso de espalda redondeada en el momento, no
+                            # solo en el resumen de la repeticion. Se usa la
+                            # mediana acumulada de la repeticion, que no
+                            # parpadea con un cuadro suelto mal segmentado.
+                            level = form_checks.rounded_back_level(metrics["back_bows"])
+                            if level:
+                                sh_px = (int(points["shoulder"][0]), int(points["shoulder"][1]))
+                                hp_px = (int(points["hip"][0]), int(points["hip"][1]))
+                                cv2.line(frame, hp_px, sh_px, (0, 0, 255), 4)
+                                texto = "ESPALDA MUY REDONDEADA" if level == 2 else "ESPALDA REDONDEADA"
+                                cv2.putText(frame, texto, (hp_px[0] + 15, hp_px[1] - 10),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+                            # La cabeza puede caer con la espalda bien, asi
+                            # que este aviso va aparte.
+                            if metrics["backneck_streak"] >= form_checks.DEADLIFT_BACKNECK_FRAMES:
                                 ear_px = (int(points["ear"][0]), int(points["ear"][1]))
                                 sc_px = (int(points["shoulder_center"][0]), int(points["shoulder_center"][1]))
                                 hc_px = (int(points["hip_center"][0]), int(points["hip_center"][1]))
                                 cv2.line(frame, hc_px, sc_px, (0, 0, 255), 4)
                                 cv2.line(frame, sc_px, ear_px, (0, 0, 255), 4)
-                                cv2.putText(frame, "ESPALDA REDONDEADA", (sc_px[0] + 15, sc_px[1]),
+                                cv2.putText(frame, "ALINEA CABEZA Y CUELLO", (sc_px[0] + 15, sc_px[1]),
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-                        metrics = form_checks.update_metrics(
-                            exercise_key, metrics, points, sign, stage, smoothed_angle, depth_angle_value,
-                            neutral_backneck=baseline,
-                        )
+                            # Cuanto llego a extenderse la cadera en la bajada
+                            # actual. Si el video/serie termina con la persona
+                            # todavia abajo, esto decide si fue un intento que
+                            # no se completo o simplemente el corte del video.
+                            if stage == "down":
+                                max_hip_in_down = max(max_hip_in_down, raw_angle)
+                            else:
+                                max_hip_in_down = 0.0
+
+                        # Veredicto de la repeticion, ya con el final del
+                        # movimiento medido. Si la persona vuelve a bajar
+                        # antes de que termine la espera, se juzga con lo
+                        # que haya para no mezclarlo con la repeticion
+                        # siguiente.
+                        if pending_rep_frames is not None:
+                            pending_rep_frames -= 1
+                            if pending_rep_frames <= 0 or stage == "down":
+                                feedback_lines = form_checks.evaluate_rep(exercise_key, config, metrics)
+                                metrics = form_checks.initial_metrics(exercise_key)
+                                pending_rep_frames = None
 
                         p_b = points[rep_b]
                         cv2.putText(frame, f"{int(smoothed_angle)} deg", (int(p_b[0]) + 10, int(p_b[1])),

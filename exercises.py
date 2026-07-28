@@ -39,7 +39,14 @@ EXERCISES = {
         "angle_up": 160,
         "angle_down": 140,
         "depth_angle": ("hip", "knee", "ankle"),
-        "depth_range": (150, 172),
+        # Rango amplio a proposito: el peso muerto convencional dobla
+        # bastante mas la rodilla que el rumano/piernas rigidas, y los
+        # dos son validos. Medido sobre video, la rodilla abajo da ~110
+        # grados en convencional y ~132 en rumano; el rango anterior
+        # (150-172) marcaba como error las dos variantes bien hechas.
+        # Fuera de este rango si cambia el ejercicio: por debajo es una
+        # sentadilla, por arriba es piernas bloqueadas.
+        "depth_range": (100, 172),
         "too_shallow_msg": "Flexiona un poco mas las rodillas, no las bloquees",
         "too_deep_msg": "Estas flexionando de mas las rodillas, eso es mas sentadilla que peso muerto",
         "good_msg": "Buena flexion de piernas!",
